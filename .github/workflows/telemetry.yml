@@ -1,0 +1,52 @@
+name: Route Quality Telemetry
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: telemetry-sync
+  cancel-in-progress: false
+
+jobs:
+  telemetry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Collect metrics and probe edge routes
+        run: python collector.py
+        env:
+          TARGET_ENDPOINT: ${{ secrets.TARGET_ENDPOINT }}
+          ADMIN_PASS: ${{ secrets.ADMIN_PASS }}
+          HOSTS_ENTRY: ${{ secrets.HOSTS_ENTRY }}
+          CHECK_CONCURRENCY: "16"
+          CHECK_TIMEOUT: "60"
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: 'public'
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
