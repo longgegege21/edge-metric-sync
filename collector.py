@@ -14,7 +14,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
 import requests
 
 for _stream in (sys.stdout, sys.stderr):
@@ -38,7 +38,7 @@ PRE_FILTER_CONCURRENCY = max(1, int(os.environ.get("PRE_FILTER_CONCURRENCY", "30
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "60"))
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "30"))
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
-TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
+GLOBAL_UA = "Mozilla/5.0 (NetProbe)"
 
 DATA_CENTER_ORG_KEYWORDS = [
     "GOOGLE", "AMAZON", "AWS", "MICROSOFT", "OVH", "HETZNER", "DIGITALOCEAN",
@@ -64,7 +64,7 @@ def log(section, msg=""):
 def fetch_raw_nodes():
     log("FETCH", f"Fetching source: {VPNGATE_API}")
     try:
-        resp = requests.get(VPNGATE_API, timeout=HTTP_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (compatible; NetProbe)"})
+        resp = requests.get(VPNGATE_API, timeout=HTTP_TIMEOUT, headers={"User-Agent": GLOBAL_UA})
         resp.raise_for_status()
         rows = parse_csv(resp.text)
         if rows:
@@ -74,7 +74,7 @@ def fetch_raw_nodes():
         log("FETCH", f"Primary API failed: {exc}, switching to mirror")
 
     try:
-        resp = requests.get(VPNGATE_MIRROR, timeout=HTTP_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
+        resp = requests.get(VPNGATE_MIRROR, timeout=HTTP_TIMEOUT, headers={"User-Agent": GLOBAL_UA})
         resp.raise_for_status()
         rows = parse_mirror_json(resp.json())
         if rows:
@@ -208,7 +208,7 @@ def classify_network(host, org):
 
 def check_one(node, session, check_base_url):
     target = f"{node['host']}:{node['port']}"
-    url = check_base_url + quote(target, safe="")
+    url = f"{check_base_url}{target}"
     out = dict(node)
     out["protocol"] = "sstp"
     out["link"] = f"sstp://vpn:vpn@{target}"
@@ -216,7 +216,7 @@ def check_one(node, session, check_base_url):
     out["checked_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     out["residential"] = "unknown"
     try:
-        r = session.get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (NetProbe)"})
+        r = session.get(url, timeout=CHECK_TIMEOUT)
         if r.status_code != 200:
             out["error"] = f"HTTP {r.status_code}"
             return out
@@ -245,7 +245,7 @@ def run_worker_checks(nodes):
         return nodes
 
     session = requests.Session()
-    session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; NetProbe)"})
+    session.headers.update({"User-Agent": GLOBAL_UA})
     
     # 自动登录支持 (针对 edgetunnel 带密码实例)
     if ADMIN_PASS:
@@ -305,7 +305,7 @@ def main():
     # 边缘探活
     results = run_worker_checks(online_nodes)
     available = [r for r in results if r.get("success")]
-    log("SUMMARY", f"Total online probes: {len(online_nodes)} | Success: {len(available)}")
+    log("SUMMARY", f"Total online probes: {len(online_nodes)} | Verified Active: {len(available)}")
 
     os.makedirs(PUBLIC_DIR, exist_ok=True)
 
@@ -330,47 +330,12 @@ def main():
         f.write(nodes_txt)
 
     # 3. public/index.html
-    html_content = """<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Edge Network Telemetry</title>
-<style>
-body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 2rem; }
-.container { max-width: 900px; margin: auto; }
-.card { background: #1e293b; border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem; border: 1px solid #334155; }
-.badge { display: inline-block; padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: 600; background: #38bdf8; color: #0f172a; margin-right: 8px; }
-.badge-green { background: #4ade80; }
-pre { background: #090d16; padding: 1rem; border-radius: 8px; overflow-x: auto; font-size: 13px; color: #94a3b8; }
-a { color: #38bdf8; text-decoration: none; }
-</style>
-</head>
-<body>
-<div class="container">
-<h2>🌐 Edge Network Telemetry & Route Probe</h2>
-<div class="card">
-<p><span class="badge" id="updated">Loading...</span><span class="badge badge-green" id="active-count">-</span></p>
-<p>订阅输出文件: <a href="nodes.txt" target="_blank"><code>nodes.txt</code></a> | 原始遥测数据: <a href="data.json" target="_blank"><code>data.json</code></a></p>
-</div>
-<div class="card">
-<h3>活跃节点列表</h3>
-<pre id="output">正在加载最新遥测数据...</pre>
-</div>
-</div>
-<script>
-fetch('data.json').then(r=>r.json()).then(d=>{
-  document.getElementById('updated').textContent = '更新时间: ' + d.generated_at;
-  document.getElementById('active-count').textContent = '有效节点: ' + d.stats.verified_active;
-  document.getElementById('output').textContent = JSON.stringify(d.nodes.slice(0, 15), null, 2);
-}).catch(e=>{
-  document.getElementById('output').textContent = '加载失败: ' + e;
-});
-</script>
-</body>
-</html>"""
-    with open(os.path.join(PUBLIC_DIR, "index.html"), "w", encoding="utf-8") as f:
-        f.write(html_content)
+    html_file = os.path.join(REPO_DIR, "web", "index.html")
+    if os.path.exists(html_file):
+        with open(html_file, "r", encoding="utf-8") as f:
+            html_content = f.read()
+        with open(os.path.join(PUBLIC_DIR, "index.html"), "w", encoding="utf-8") as f:
+            f.write(html_content)
 
     log("OUTPUT", f"Generated public/data.json, public/nodes.txt ({len(available)} nodes), public/index.html")
 
