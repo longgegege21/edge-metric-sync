@@ -40,6 +40,7 @@ jobs:
           CHECK_TIMEOUT: "60"
           MIN_NODES: "10"
           PAGES_BASE: "https://longgegege21.github.io/edge-metric-sync"
+          OPTIMAL_API: "https://cf.090227.xyz/ct?ips=6&port=443"
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5

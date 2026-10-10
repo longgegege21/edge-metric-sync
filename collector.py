@@ -45,6 +45,10 @@ MIN_NODES = max(1, int(os.environ.get("MIN_NODES", "10")))
 # 已发布产物地址（用于取回上一份可用 nodes.txt 做保底回退）
 PAGES_BASE = os.environ.get("PAGES_BASE", "https://longgegege21.github.io/edge-metric-sync")
 
+# 优选入口 API：按运营商线路返回 CF 原生优选 IP（格式 IP:port#备注）。
+# 留空则退回固定的 HOSTS_ENTRY。电信=/ct，联通=/cu，移动=/cmcc
+OPTIMAL_API = os.environ.get("OPTIMAL_API", "")
+
 # IP 情报接口（判定住宅/机房），ip-api.com 免费批量接口
 IPAPI_BATCH = os.environ.get("IPAPI_BATCH", "http://ip-api.com/batch")
 IPAPI_FIELDS = "status,query,hosting,proxy,isp,org,as,countryCode"
@@ -326,7 +330,41 @@ def run_worker_checks(nodes, ip_meta):
             results.append(fut.result())
     return results
 
-def build_nodes_text(available_nodes):
+def fetch_optimal_entries():
+    """从优选 API 拉取入口列表（IP:port）。失败返回 []，调用方回退到 HOSTS_ENTRY。
+
+    返回形如 ['104.26.10.41:443', '172.67.78.46:443']。
+    优选只优化「客户端→CF 入口」这一段，不改变 CF→SSTP 那段。
+    """
+    if not OPTIMAL_API:
+        return []
+    try:
+        r = requests.get(OPTIMAL_API, timeout=HTTP_TIMEOUT, headers={"User-Agent": GLOBAL_UA})
+        r.raise_for_status()
+        entries = []
+        for line in r.text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            addr = line.split("#")[0].strip()
+            if not addr:
+                continue
+            if ":" not in addr:
+                addr = f"{addr}:443"
+            host, _, port = addr.rpartition(":")
+            if not host or not port.isdigit():
+                continue
+            if not (1 <= int(port) <= 65535):
+                continue
+            if addr not in entries:
+                entries.append(addr)
+        log("OPTIMAL", f"Fetched {len(entries)} optimal entries from {OPTIMAL_API}")
+        return entries
+    except Exception as exc:
+        log("OPTIMAL", f"Optimal API failed ({exc}); falling back to HOSTS_ENTRY")
+        return []
+
+def build_nodes_text(available_nodes, entries=None):
     lines = []
     # 按国家分组，住宅优先，延迟升序
     ordered = sorted(available_nodes, key=lambda n: (
@@ -336,7 +374,8 @@ def build_nodes_text(available_nodes):
     ))
     res_count = {}
     dc_count = {}
-    for n in ordered:
+    entries = entries or []
+    for idx, n in enumerate(ordered):
         cc = (n.get("country_code") or "XX").upper()
         zh = COUNTRY_ZH.get(cc, cc)
         is_res = (n.get("residential") == "residential")
@@ -349,8 +388,10 @@ def build_nodes_text(available_nodes):
             seq = dc_count[cc]
             tag = f"{zh}-机房-{seq:02d}"
 
+        # 入口：有优选列表则轮换使用（前几个节点优先拿到最优入口），否则退回固定 HOSTS_ENTRY
+        entry = entries[idx % len(entries)] if entries else HOSTS_ENTRY
         target = f"{n['host']}:{n['port']}"
-        lines.append(f"{HOSTS_ENTRY}#{tag}$sstp://vpn:vpn@{target}")
+        lines.append(f"{entry}#{tag}$sstp://vpn:vpn@{target}")
     return "\n".join(lines) + "\n"
 
 def fetch_last_good_nodes():
@@ -393,11 +434,15 @@ def main():
         else:
             log("GUARD", "No last-good snapshot available; publishing current result as-is (first run?).")
 
+    # 优选入口（电信/联通/移动由 OPTIMAL_API 决定；为空则用固定 HOSTS_ENTRY）
+    entries = fetch_optimal_entries()
+
     # 1. public/data.json
     data = {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "source": source,
         "degraded": degraded,
+        "entries": entries,
         "stats": {
             "raw_nodes": raw_count,
             "tcp_candidates": len(tcp_nodes),
@@ -416,8 +461,9 @@ def main():
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     res_n = sum(1 for n in available if n.get("residential") == "residential")
     dc_n = len(available) - res_n
-    header_line = f"# updated {stamp} | {len(available)} nodes | {res_n} residential / {dc_n} datacenter"
-    nodes_content = fallback_text if (degraded and fallback_text) else header_line + "\n" + build_nodes_text(available)
+    entry_desc = f"{len(entries)} optimal entries" if entries else HOSTS_ENTRY
+    header_line = f"# updated {stamp} | {len(available)} nodes | {res_n} residential / {dc_n} datacenter | entry: {entry_desc}"
+    nodes_content = fallback_text if (degraded and fallback_text) else header_line + "\n" + build_nodes_text(available, entries)
     with open(os.path.join(PUBLIC_DIR, "nodes.txt"), "w", encoding="utf-8") as f:
         f.write(nodes_content)
 
