@@ -11,7 +11,7 @@ import os
 import re
 import socket
 import sys
-import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -40,18 +40,20 @@ HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "30"))
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
 GLOBAL_UA = "Mozilla/5.0 (NetProbe)"
 
+# 保底阈值：可用节点少于此数时，不覆盖已发布的 nodes.txt（避免订阅被清空）
+MIN_NODES = max(1, int(os.environ.get("MIN_NODES", "10")))
+# 已发布产物地址（用于取回上一份可用 nodes.txt 做保底回退）
+PAGES_BASE = os.environ.get("PAGES_BASE", "https://longgegege21.github.io/edge-metric-sync")
+
+# IP 情报接口（判定住宅/机房），ip-api.com 免费批量接口
+IPAPI_BATCH = os.environ.get("IPAPI_BATCH", "http://ip-api.com/batch")
+IPAPI_FIELDS = "status,query,hosting,proxy,isp,org,as,countryCode"
+
 DATA_CENTER_ORG_KEYWORDS = [
     "GOOGLE", "AMAZON", "AWS", "MICROSOFT", "OVH", "HETZNER", "DIGITALOCEAN",
     "AKAMAI", "CLOUDFLARE", "FASTLY", "RACKSPACE", "EQUINIX", "LINODE", "VULTR",
     "HURRICANE", "TENCENT", "ALIBABA", "ALIYUN", "LEASWEB",
 ]
-RESIDENTIAL_ORG_KEYWORDS = [
-    "NTT", "KDDI", "DOCOMO", "SOFTBANK", "AU COMMUNICATIONS", "J:COM", "JCOM", "OCN", "BIGLOBE",
-    "IIJ", "SEIKO", "AT&T", "COMCAST", "XFINITY", "VERIZON", "TELUS", "ROGERS", "BELL CANADA",
-    "VODAFONE", "ORANGE", "DEUTSCHE TELEKOM", "BREEZE", "TIM S.P.A", "LIBERO", "FASTWEB",
-    "KT", "SK BROADBAND", "LGU+", "LG POWERCOM", "KOREA TELECOM", "CHUNGHWA",
-]
-
 COUNTRY_ZH = {
     "JP": "日本", "KR": "韩国", "US": "美国", "CA": "加拿大", "RU": "俄罗斯",
     "RO": "罗马尼亚", "TH": "泰国", "VN": "越南", "DE": "德国", "FR": "法国",
@@ -60,6 +62,42 @@ COUNTRY_ZH = {
 
 def log(section, msg=""):
     print(f"[{section}] {msg}", flush=True)
+
+# ---------------------------------------------------------------------------
+# 线程本地 Session
+# 修复：原实现把单个 requests.Session 交给 16 个线程并发复用。
+# requests.Session 并非线程安全，并发下会出现连接池串扰 / Cookie 错乱 / 随机失败。
+# ---------------------------------------------------------------------------
+_thread_local = threading.local()
+_base_cookies = None
+
+def _do_login():
+    """主线程登录一次，取回认证 Cookie，供各工作线程复用。"""
+    global _base_cookies
+    if not ADMIN_PASS or not TARGET_ENDPOINT:
+        return
+    try:
+        parsed = urlparse(TARGET_ENDPOINT)
+        login_url = f"{parsed.scheme}://{parsed.netloc}/login"
+        log("AUTH", f"Authenticating with target management endpoint: {login_url}")
+        s = requests.Session()
+        s.headers.update({"User-Agent": GLOBAL_UA})
+        lr = s.post(login_url, data={"password": ADMIN_PASS}, timeout=15)
+        log("AUTH", f"Auth response: HTTP {lr.status_code}")
+        _base_cookies = s.cookies
+    except Exception as e:
+        log("AUTH", f"Auth error: {e}")
+
+def get_session():
+    """每个线程各自惰性创建一个 Session，并复用登录 Cookie。"""
+    s = getattr(_thread_local, "session", None)
+    if s is None:
+        s = requests.Session()
+        s.headers.update({"User-Agent": GLOBAL_UA})
+        if _base_cookies:
+            s.cookies.update(_base_cookies)
+        _thread_local.session = s
+    return s
 
 def fetch_raw_nodes():
     log("FETCH", f"Fetching source: {VPNGATE_API}")
@@ -82,7 +120,7 @@ def fetch_raw_nodes():
             return rows, "github-mirror"
     except Exception as exc:
         log("FETCH", f"Mirror failed: {exc}")
-    
+
     sys.exit("[FATAL] All data sources failed.")
 
 def parse_csv(text):
@@ -194,27 +232,63 @@ def pre_filter_nodes(nodes):
     log("PRE_FILTER", f"TCP pre-filter passed: {len(alive)}/{len(nodes)} endpoints online")
     return alive
 
-def classify_network(host, org):
+def enrich_ip_meta(nodes):
+    """批量查询节点 IP 归属（ip-api.com/batch），作为住宅/机房判定依据。
+
+    返回 {ip: {status, hosting, proxy, isp, org, as, countryCode, query}}。
+    修复：原 classify_network 的 org 关键词表从未被喂入数据，判定实际退化为
+    「public-vpn-* → 机房，其余一律住宅」，导致大量 VPS 中继被误标为住宅。
+    """
+    ips = sorted({n["ip"] for n in nodes if n.get("ip")})
+    meta = {}
+    if not ips:
+        return meta
+    for i in range(0, len(ips), 100):
+        chunk = ips[i:i + 100]
+        try:
+            resp = requests.post(
+                f"{IPAPI_BATCH}?fields={IPAPI_FIELDS}",
+                json=[{"query": ip} for ip in chunk],
+                timeout=HTTP_TIMEOUT,
+                headers={"User-Agent": GLOBAL_UA},
+            )
+            resp.raise_for_status()
+            for item in resp.json():
+                q = item.get("query")
+                if q:
+                    meta[q] = item
+        except Exception as exc:
+            log("ENRICH", f"ip-api batch failed (chunk {i // 100}): {exc}")
+    log("ENRICH", f"Enriched {len(meta)}/{len(ips)} node IPs via ip-api")
+    return meta
+
+def classify_network(host, meta=None):
+    """住宅/机房判定：优先用 IP 情报(ip-api 的 hosting 标记)，回退到 host 规则。"""
+    # VPN Gate 项目自有服务器（public-vpn-*，ISP=SoftEther）一律视为机房。
+    # 不能仅凭 ip-api 的 hosting 标记：SoftEther 的 ASN 会被判为 non-hosting。
     if host.lower().startswith("public-vpn"):
         return "datacenter"
-    org = (org or "").upper()
-    if any(k in org for k in DATA_CENTER_ORG_KEYWORDS):
-        return "datacenter"
-    if any(k in org for k in RESIDENTIAL_ORG_KEYWORDS):
+    if isinstance(meta, dict) and meta.get("status") == "success":
+        if meta.get("hosting") is True:
+            return "datacenter"
+        org = f"{meta.get('isp', '')} {meta.get('org', '')} {meta.get('as', '')}".upper()
+        if any(k in org for k in DATA_CENTER_ORG_KEYWORDS):
+            return "datacenter"
         return "residential"
-    if re.match(r"^vpn\d{5,}", host.lower()):
-        return "residential"
+    # 回退：无 IP 情报时按 host 命名规则
     return "residential"
 
-def check_one(node, session, check_base_url):
+def check_one(node, check_base_url, ip_meta):
+    session = get_session()
     target = f"{node['host']}:{node['port']}"
     url = f"{check_base_url}{target}"
+    src_ip = node.get("ip")
     out = dict(node)
     out["protocol"] = "sstp"
     out["link"] = f"sstp://vpn:vpn@{target}"
     out["status"] = "failed"
     out["checked_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    out["residential"] = "unknown"
+    out["residential"] = classify_network(out["host"], ip_meta.get(src_ip))
     try:
         r = session.get(url, timeout=CHECK_TIMEOUT)
         if r.status_code != 200:
@@ -228,40 +302,26 @@ def check_one(node, session, check_base_url):
         out["ip"] = j.get("ip") or out.get("ip")
         out["loc"] = j.get("loc") or out.get("country_code")
         out["error"] = None if ok else (j.get("error") or "check failed")
-        out["residential"] = classify_network(out["host"], "")
         return out
     except Exception as exc:
         out["error"] = f"{type(exc).__name__}: {exc}"
         return out
 
-def run_worker_checks(nodes):
+def run_worker_checks(nodes, ip_meta):
     if not TARGET_ENDPOINT:
         log("CHECK", "No TARGET_ENDPOINT specified. Skipping worker deep probe.")
         for n in nodes:
             n["success"] = True
             n["status"] = "success"
             n["latency_ms"] = 0
-            n["residential"] = classify_network(n["host"], "")
+            n["residential"] = classify_network(n["host"], ip_meta.get(n.get("ip")))
         return nodes
 
-    session = requests.Session()
-    session.headers.update({"User-Agent": GLOBAL_UA})
-    
-    # 自动登录支持 (针对 edgetunnel 带密码实例)
-    if ADMIN_PASS:
-        try:
-            parsed = urlparse(TARGET_ENDPOINT)
-            login_url = f"{parsed.scheme}://{parsed.netloc}/login"
-            log("AUTH", f"Authenticating with target management endpoint: {login_url}")
-            lr = session.post(login_url, data={"password": ADMIN_PASS}, timeout=15)
-            log("AUTH", f"Auth response: HTTP {lr.status_code}")
-        except Exception as e:
-            log("AUTH", f"Auth error: {e}")
-
+    _do_login()
     log("CHECK", f"Submitting {len(nodes)} online endpoints to edge worker probe (concurrency={CONCURRENCY})...")
     results = []
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        futures = [pool.submit(check_one, n, session, TARGET_ENDPOINT) for n in nodes]
+        futures = [pool.submit(check_one, n, TARGET_ENDPOINT, ip_meta) for n in nodes]
         for fut in as_completed(futures):
             results.append(fut.result())
     return results
@@ -288,10 +348,20 @@ def build_nodes_text(available_nodes):
             dc_count[cc] = dc_count.get(cc, 0) + 1
             seq = dc_count[cc]
             tag = f"{zh}-机房-{seq:02d}"
-        
+
         target = f"{n['host']}:{n['port']}"
         lines.append(f"{HOSTS_ENTRY}#{tag}$sstp://vpn:vpn@{target}")
     return "\n".join(lines) + "\n"
+
+def fetch_last_good_nodes():
+    """取回当前已发布的 nodes.txt，作为保底回退内容。"""
+    try:
+        r = requests.get(f"{PAGES_BASE}/nodes.txt", timeout=HTTP_TIMEOUT, headers={"User-Agent": GLOBAL_UA})
+        if r.status_code == 200 and r.text.strip():
+            return r.text
+    except Exception as exc:
+        log("GUARD", f"Could not fetch last-good nodes.txt: {exc}")
+    return None
 
 def main():
     rows, source = fetch_raw_nodes()
@@ -301,18 +371,33 @@ def main():
 
     # 本地前置预检
     online_nodes = pre_filter_nodes(tcp_nodes)
-    
+
+    # IP 情报富化（住宅/机房判定依据）
+    ip_meta = enrich_ip_meta(online_nodes)
+
     # 边缘探活
-    results = run_worker_checks(online_nodes)
+    results = run_worker_checks(online_nodes, ip_meta)
     available = [r for r in results if r.get("success")]
     log("SUMMARY", f"Total online probes: {len(online_nodes)} | Verified Active: {len(available)}")
 
     os.makedirs(PUBLIC_DIR, exist_ok=True)
 
+    # 保底：可用节点过少时，回退到上一份已发布 nodes.txt，避免把订阅清空
+    degraded = len(available) < MIN_NODES
+    fallback_text = None
+    if degraded:
+        log("GUARD", f"Only {len(available)} active nodes (< MIN_NODES={MIN_NODES}).")
+        fallback_text = fetch_last_good_nodes()
+        if fallback_text:
+            log("GUARD", "Refusing to overwrite subscription; republishing last-good nodes.txt.")
+        else:
+            log("GUARD", "No last-good snapshot available; publishing current result as-is (first run?).")
+
     # 1. public/data.json
     data = {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "source": source,
+        "degraded": degraded,
         "stats": {
             "raw_nodes": raw_count,
             "tcp_candidates": len(tcp_nodes),
@@ -324,10 +409,10 @@ def main():
     with open(os.path.join(PUBLIC_DIR, "data.json"), "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-    # 2. public/nodes.txt
-    nodes_txt = build_nodes_text(available)
+    # 2. public/nodes.txt（保底时回退旧内容）
+    nodes_content = fallback_text if (degraded and fallback_text) else build_nodes_text(available)
     with open(os.path.join(PUBLIC_DIR, "nodes.txt"), "w", encoding="utf-8") as f:
-        f.write(nodes_txt)
+        f.write(nodes_content)
 
     # 3. public/index.html
     html_file = os.path.join(REPO_DIR, "web", "index.html")
@@ -337,7 +422,7 @@ def main():
         with open(os.path.join(PUBLIC_DIR, "index.html"), "w", encoding="utf-8") as f:
             f.write(html_content)
 
-    log("OUTPUT", f"Generated public/data.json, public/nodes.txt ({len(available)} nodes), public/index.html")
+    log("OUTPUT", f"Generated public/data.json, public/nodes.txt ({len(available)} nodes, degraded={degraded}), public/index.html")
 
 if __name__ == "__main__":
     main()

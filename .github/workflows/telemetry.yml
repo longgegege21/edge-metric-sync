@@ -38,6 +38,8 @@ jobs:
           HOSTS_ENTRY: ${{ secrets.HOSTS_ENTRY }}
           CHECK_CONCURRENCY: "16"
           CHECK_TIMEOUT: "60"
+          MIN_NODES: "10"
+          PAGES_BASE: "https://longgegege21.github.io/edge-metric-sync"
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
