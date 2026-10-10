@@ -409,8 +409,15 @@ def main():
     with open(os.path.join(PUBLIC_DIR, "data.json"), "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-    # 2. public/nodes.txt（保底时回退旧内容）
-    nodes_content = fallback_text if (degraded and fallback_text) else build_nodes_text(available)
+    # 2. public/nodes.txt（保底时回退旧内容；顶部带时间标记）
+    # 时间标记用注释行：edgetunnel 对不匹配 "地址[:端口][#备注]" 的行会 return null，
+    # 随后被 .filter(item => item !== null) 过滤掉，因此注释行安全。
+    # 但注释行内绝不能出现逗号——否则会被 isCSV = lines[0].includes(',') 误判为 CSV，整段按 CSV 解析。
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    res_n = sum(1 for n in available if n.get("residential") == "residential")
+    dc_n = len(available) - res_n
+    header_line = f"# updated {stamp} | {len(available)} nodes | {res_n} residential / {dc_n} datacenter"
+    nodes_content = fallback_text if (degraded and fallback_text) else header_line + "\n" + build_nodes_text(available)
     with open(os.path.join(PUBLIC_DIR, "nodes.txt"), "w", encoding="utf-8") as f:
         f.write(nodes_content)
 
