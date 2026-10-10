@@ -330,39 +330,66 @@ def run_worker_checks(nodes, ip_meta):
             results.append(fut.result())
     return results
 
-def fetch_optimal_entries():
-    """从优选 API 拉取入口列表（IP:port）。失败返回 []，调用方回退到 HOSTS_ENTRY。
+_IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
 
-    返回形如 ['104.26.10.41:443', '172.67.78.46:443']。
+def _parse_optimal_text(text):
+    """把优选 API 返回文本解析成 ['IP:port', ...]。
+
+    严格只接受 IPv4[:port]（可带 #备注）。宁可返回空（回退固定入口），
+    也绝不把 HTML 错误页/垃圾内容当成入口——否则会污染 nodes.txt
+    （实测：源返回 HTML 时曾解析出 413 条垃圾）。
+    """
+    if not text or "<" in text or ">" in text:   # HTML / 错误页，直接拒绝
+        return []
+    entries = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        addr = line.split("#")[0].strip()
+        if not addr:
+            continue
+        if ":" in addr:
+            host, _, port = addr.rpartition(":")
+        else:
+            host, port = addr, "443"
+        host = host.strip()
+        if not _IPV4_RE.match(host):
+            continue
+        if any(int(o) > 255 for o in host.split(".")):
+            continue
+        if not port.isdigit() or not (1 <= int(port) <= 65535):
+            continue
+        e = f"{host}:{port}"
+        if e not in entries:
+            entries.append(e)
+    if len(entries) > 50:   # 数量离谱，判为异常内容
+        return []
+    return entries
+
+def fetch_optimal_entries():
+    """从优选 API 拉取入口列表（IP:port）。
+
+    OPTIMAL_API 支持逗号分隔多个源，按顺序尝试，第一个返回非空的即采用；
+    全部失败则返回 []，调用方回退到固定的 HOSTS_ENTRY（流水线不会因此中断）。
     优选只优化「客户端→CF 入口」这一段，不改变 CF→SSTP 那段。
     """
-    if not OPTIMAL_API:
+    sources = [s.strip() for s in OPTIMAL_API.split(",") if s.strip()]
+    if not sources:
         return []
-    try:
-        r = requests.get(OPTIMAL_API, timeout=HTTP_TIMEOUT, headers={"User-Agent": GLOBAL_UA})
-        r.raise_for_status()
-        entries = []
-        for line in r.text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            addr = line.split("#")[0].strip()
-            if not addr:
-                continue
-            if ":" not in addr:
-                addr = f"{addr}:443"
-            host, _, port = addr.rpartition(":")
-            if not host or not port.isdigit():
-                continue
-            if not (1 <= int(port) <= 65535):
-                continue
-            if addr not in entries:
-                entries.append(addr)
-        log("OPTIMAL", f"Fetched {len(entries)} optimal entries from {OPTIMAL_API}")
-        return entries
-    except Exception as exc:
-        log("OPTIMAL", f"Optimal API failed ({exc}); falling back to HOSTS_ENTRY")
-        return []
+    for src in sources:
+        try:
+            r = requests.get(src, timeout=HTTP_TIMEOUT, headers={"User-Agent": GLOBAL_UA})
+            r.raise_for_status()
+            entries = _parse_optimal_text(r.text)
+            if entries:
+                log("OPTIMAL", f"Fetched {len(entries)} optimal entries from {src}")
+                return entries
+            log("OPTIMAL", f"{src} returned no usable entries; trying next source")
+        except Exception as exc:
+            log("OPTIMAL", f"Source failed ({src}): {exc}; trying next")
+    log("OPTIMAL", "All optimal sources failed; falling back to HOSTS_ENTRY")
+    return []
 
 def build_nodes_text(available_nodes, entries=None):
     lines = []
