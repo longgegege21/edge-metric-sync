@@ -13,7 +13,7 @@ import socket
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 import requests
 
@@ -485,7 +485,10 @@ def main():
     # 时间标记用注释行：edgetunnel 对不匹配 "地址[:端口][#备注]" 的行会 return null，
     # 随后被 .filter(item => item !== null) 过滤掉，因此注释行安全。
     # 但注释行内绝不能出现逗号——否则会被 isCSV = lines[0].includes(',') 误判为 CSV，整段按 CSV 解析。
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    # 时间标记用北京时间显示（UTC+8）——之前只写 UTC，龙哥按本地时间读会误以为没更新
+    cst = timezone(timedelta(hours=8))
+    now_utc = datetime.now(timezone.utc)
+    stamp = f"{datetime.now(cst).strftime('%Y-%m-%d %H:%M:%S')} 北京时间 (UTC {now_utc.strftime('%H:%M:%S')})"
     res_n = sum(1 for n in available if n.get("residential") == "residential")
     dc_n = len(available) - res_n
     entry_desc = f"{len(entries)} optimal entries" if entries else HOSTS_ENTRY
